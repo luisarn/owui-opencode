@@ -2,7 +2,7 @@
 title: OpenCode Agent
 description: Run OpenCode's agent loop from inside OpenWebUI chats, sandboxed in Docker containers.
 author: Assistant
-version: 0.3
+version: 0.7
 license: MIT
 requirements: httpx, docker
 """
@@ -364,11 +364,25 @@ class Pipe:
         )
         PROVIDER: str = Field(
             default="anthropic",
-            description="LLM provider ID (e.g., anthropic, openai, google, or any opencode provider).",
+            description="LLM provider ID (e.g., anthropic, openai, google, or any opencode provider). Set to 'custom' when using CUSTOM_BASE_URL.",
         )
         MODEL: str = Field(
             default="claude-3-5-sonnet-20241022",
-            description="Model ID. For anthropic, use e.g. claude-3-5-sonnet-20241022. Format depends on provider.",
+            description="Model ID. For anthropic, use e.g. claude-3-5-sonnet-20241022. For custom providers, use the model ID as expected by that API.",
+        )
+        CUSTOM_BASE_URL: str = Field(
+            default="",
+            description=(
+                "Base URL for a custom OpenAI-compatible provider "
+                "(e.g. http://host.docker.internal:11434/v1 for Ollama, "
+                "or https://api.groq.com/openai/v1 for Groq). "
+                "When set, PROVIDER must be 'custom' and MODEL must be the model ID "
+                "that the custom API accepts. CUSTOM_API_KEY is used as the API key."
+            ),
+        )
+        CUSTOM_API_KEY: str = Field(
+            default="",
+            description="API key for the custom provider. Leave empty if the endpoint requires no key (e.g. local Ollama).",
         )
         WORKDIR_ROOT: str = Field(
             default="/tmp/opencode-pipe",
@@ -429,19 +443,26 @@ class Pipe:
 
         env: Dict[str, str] = {}
         provider = self.valves.PROVIDER.lower()
-        if provider == "anthropic" and self.valves.ANTHROPIC_API_KEY:
+
+        # Always pass API keys for well-known providers.
+        if self.valves.ANTHROPIC_API_KEY:
             env["ANTHROPIC_API_KEY"] = self.valves.ANTHROPIC_API_KEY
-        elif provider == "openai" and self.valves.OPENAI_API_KEY:
+        if self.valves.OPENAI_API_KEY:
             env["OPENAI_API_KEY"] = self.valves.OPENAI_API_KEY
-        elif provider == "google" and self.valves.GOOGLE_API_KEY:
+        if self.valves.GOOGLE_API_KEY:
             env["GOOGLE_API_KEY"] = self.valves.GOOGLE_API_KEY
-        else:
-            if self.valves.ANTHROPIC_API_KEY:
-                env["ANTHROPIC_API_KEY"] = self.valves.ANTHROPIC_API_KEY
-            if self.valves.OPENAI_API_KEY:
-                env["OPENAI_API_KEY"] = self.valves.OPENAI_API_KEY
-            if self.valves.GOOGLE_API_KEY:
-                env["GOOGLE_API_KEY"] = self.valves.GOOGLE_API_KEY
+
+        # Write an opencode.json config so the container knows which model to use
+        # by default. This avoids sending model in every prompt body (which causes
+        # a 500 if the provider isn't loaded yet or the model ID is unknown).
+        # For custom providers the config also registers the provider itself.
+        if self.valves.PROVIDER and self.valves.MODEL:
+            config = self._build_provider_config(provider)
+            config_path = workdir / ".opencode.json"
+            config_path.write_text(json.dumps(config, indent=2))
+            env["OPENCODE_CONFIG"] = "/workspace/.opencode.json"
+        if provider == "custom" and self.valves.CUSTOM_API_KEY:
+            env["CUSTOM_OPENCODE_API_KEY"] = self.valves.CUSTOM_API_KEY
 
         self._docker.run_container(
             name=container_name,
@@ -462,10 +483,39 @@ class Pipe:
         }
         return port
 
+    def _build_provider_config(self, provider: str) -> Dict[str, Any]:
+        """Build an opencode.json that sets the default model and (for custom
+        providers) registers the provider itself.
+
+        The config ``model`` field uses ``providerID/modelID`` format.
+        OpenCode reads this via OPENCODE_CONFIG so the container starts with
+        the right default and we never need to send ``model`` in prompt bodies.
+        """
+        config: Dict[str, Any] = {
+            "$schema": "https://opencode.ai/config.json",
+            "model": f"{provider}/{self.valves.MODEL}",
+        }
+        if provider == "custom" and self.valves.CUSTOM_BASE_URL:
+            options: Dict[str, Any] = {"baseURL": self.valves.CUSTOM_BASE_URL}
+            # Reference the API key via env-var substitution so it's never
+            # written to disk. Omit if no key is needed (e.g. local Ollama).
+            if self.valves.CUSTOM_API_KEY:
+                options["apiKey"] = "{env:CUSTOM_OPENCODE_API_KEY}"
+            config["provider"] = {
+                "custom": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "name": "Custom",
+                    "options": options,
+                }
+            }
+        return config
+
     async def _wait_for_health(self, name: str, port: int) -> None:
         if httpx is None:
             raise RuntimeError("httpx is required but not installed.")
-        url = f"{self._container_url(name, port)}/health"
+        # OpenCode v1.15+ serves the web UI on / and /health;
+        # /session is a real API endpoint that returns JSON when ready.
+        url = f"{self._container_url(name, port)}/session"
         async with httpx.AsyncClient() as client:
             deadline = time.time() + self.valves.CONTAINER_TIMEOUT
             while time.time() < deadline:
@@ -538,10 +588,10 @@ class Pipe:
         base_url = self._container_url(name, port)
         async with httpx.AsyncClient() as client:
             await client.post(
-                f"{base_url}/session/{session_id}/prompt",
+                f"{base_url}/session/{session_id}/message",
                 json={
-                    "noReply": True,
                     "parts": [{"type": "text", "text": f"System instructions:\n{system}"}],
+                    "noReply": True,
                 },
                 timeout=10.0,
             )
@@ -553,26 +603,47 @@ class Pipe:
         if httpx is None:
             raise RuntimeError("httpx is required but not installed.")
 
-        body: Dict[str, Any] = {
-            "parts": [{"type": "text", "text": text}],
-        }
-        if self.valves.PROVIDER and self.valves.MODEL:
-            body["model"] = {
-                "providerID": self.valves.PROVIDER,
-                "modelID": self.valves.MODEL,
-            }
-
         base_url = self._container_url(name, port)
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                f"{base_url}/session/{session_id}/prompt",
-                json=body,
+                f"{base_url}/session/{session_id}/message",
+                json={"parts": [{"type": "text", "text": text}]},
                 timeout=300.0,
             )
             resp.raise_for_status()
             return resp.json()
 
     def _extract_response_text(self, data: Dict[str, Any]) -> str:
+        # v1.15+ response shape: {info: {...}, parts: [{type, text, ...}, ...]}
+        # Parts can be: step-start, reasoning, text, tool, step-finish
+        parts = data.get("parts", [])
+        if isinstance(parts, list):
+            texts = []
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type", "")
+                if ptype == "text":
+                    texts.append(str(part.get("text", "")))
+                elif ptype == "reasoning":
+                    thinking = str(part.get("text", "")).strip()
+                    if thinking:
+                        texts.append(
+                            f"\n\n<details>\n"
+                            f"<summary>💭 Thinking</summary>\n\n"
+                            f"{thinking}\n\n"
+                            f"</details>\n\n"
+                        )
+                elif ptype == "tool":
+                    tool_name = part.get("tool", "tool")
+                    state = part.get("state", {})
+                    tool_input = state.get("input", {})
+                    if isinstance(tool_input, dict):
+                        texts.append(self._format_tool_use(tool_name, tool_input))
+            if texts:
+                return "\n".join(texts)
+
+        # Legacy / fallback: try old data.info.parts nesting
         candidates = [data.get("data", {}), data]
         for candidate in candidates:
             info = candidate.get("info", candidate)
@@ -600,44 +671,64 @@ class Pipe:
     # -- Streaming (SSE) ----------------------------------------------------
 
     async def _sse_listener(self, base_url: str, queue: asyncio.Queue) -> None:
-        """Background task that reads the OpenCode SSE event stream."""
+        """Background task that reads the OpenCode SSE event stream.
+
+        OpenCode v1.15+ uses ``GET /event`` (not ``/event/subscribe``) and
+        emits events in the shape ``{id, type, properties}`` where
+        ``type`` is the event name and ``properties`` carries the payload.
+        The SSE stream does **not** use ``event:`` lines — every event
+        arrives as a ``data:`` line with the full JSON object.
+        """
         try:
             async with httpx.AsyncClient() as client:
                 async with client.stream(
                     "GET",
-                    f"{base_url}/event/subscribe",
+                    f"{base_url}/event",
                     headers={"Accept": "text/event-stream"},
                     timeout=None,
                 ) as response:
-                    current_event_type = ""
-                    current_data_lines: List[str] = []
-
                     async for line in response.aiter_lines():
-                        if line.startswith("event:"):
-                            current_event_type = line[6:].strip()
-                        elif line.startswith("data:"):
-                            current_data_lines.append(line[5:].strip())
-                        elif line == "":
-                            if current_data_lines:
-                                data_str = "\n".join(current_data_lines)
-                                try:
-                                    data = json.loads(data_str)
-                                except json.JSONDecodeError:
-                                    data = {"raw": data_str}
-                                await queue.put({
-                                    "type": current_event_type,
-                                    "data": data,
-                                })
-                            current_event_type = ""
-                            current_data_lines = []
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if not payload:
+                            continue
+                        try:
+                            evt = json.loads(payload)
+                        except json.JSONDecodeError:
+                            continue
+                        ev_type = evt.get("type", "")
+                        ev_data = evt.get("properties", {})
+                        if ev_type == "server.connected":
+                            continue
+                        if ev_type == "server.heartbeat":
+                            continue
+                        await queue.put({
+                            "type": ev_type,
+                            "data": ev_data,
+                        })
         except Exception as exc:
             log.warning("SSE listener error: %s", exc)
         finally:
             await queue.put(None)  # sentinel
 
-    # -- Event parsers (defensive — tries multiple shapes) ------------------
+    # -- Event parsers for OpenCode v1.15+ SSE format -----------------------
+    # SSE events arrive as {type: "event.name", properties: {…}}.
+    # Key event types:
+    #   message.part.delta  — streaming text/reasoning deltas
+    #     {sessionID, messageID, partID, field, delta}
+    #   message.part.updated — complete part (text, reasoning, tool, step-start/finish)
+    #     {sessionID, part: {type, text, …}, time}
+    #   session.idle — agent finished processing
 
     def _extract_text_from_event(self, ev_type: str, data: Dict[str, Any]) -> Optional[str]:
+        # v1.15+: message.part.delta with field="text" carries streaming text
+        if ev_type == "message.part.delta":
+            if data.get("field") == "text":
+                return str(data.get("delta", ""))
+            return None
+
+        # Legacy formats (pre-v1.15)
         if ev_type in ("content_block_delta", "delta"):
             delta = data.get("delta", data)
             if isinstance(delta, dict):
@@ -647,16 +738,10 @@ class Pipe:
         if ev_type in ("text", "text_delta"):
             return str(data.get("text", data.get("content", "")))
 
-        if ev_type in ("message", "content", "response"):
-            content = data.get("content", data.get("text", data))
-            if isinstance(content, str):
-                return content
-            if isinstance(content, dict):
-                return content.get("text", "")
-
         return None
 
     def _is_thinking_start(self, ev_type: str, data: Dict[str, Any]) -> bool:
+        # Legacy formats only (v1.15+ is handled in _run_streaming directly)
         if ev_type == "content_block_start":
             block = data.get("content_block", data)
             return isinstance(block, dict) and block.get("type") == "thinking"
@@ -665,6 +750,7 @@ class Pipe:
         return False
 
     def _is_thinking_delta(self, ev_type: str, data: Dict[str, Any]) -> bool:
+        # Legacy formats only (v1.15+ is handled in _run_streaming directly)
         if ev_type == "content_block_delta":
             delta = data.get("delta", data)
             return isinstance(delta, dict) and delta.get("type") == "thinking_delta"
@@ -673,12 +759,17 @@ class Pipe:
         return False
 
     def _extract_thinking(self, data: Dict[str, Any]) -> str:
+        # v1.15+: delta is in data["delta"]
+        if "delta" in data:
+            return str(data.get("delta", ""))
+        # Legacy
         delta = data.get("delta", data)
         if isinstance(delta, dict):
             return str(delta.get("thinking", ""))
         return str(data.get("thinking", ""))
 
     def _is_thinking_stop(self, ev_type: str, data: Dict[str, Any]) -> bool:
+        # Legacy formats only (v1.15+ is handled in _run_streaming directly)
         return ev_type == "content_block_stop" or ev_type in ("thinking_stop",)
 
     def _format_thinking(self, text: str) -> str:
@@ -690,6 +781,7 @@ class Pipe:
         )
 
     def _extract_tool_use(self, ev_type: str, data: Dict[str, Any]) -> Optional[Tuple[str, Dict[str, Any]]]:
+        # Legacy formats only (v1.15+ is handled in _run_streaming directly)
         if ev_type in ("tool_use", "tool_use_start", "tool_call", "tool"):
             name = data.get("name", "tool")
             input_data = data.get("input", data.get("arguments", data.get("params", {})))
@@ -710,6 +802,9 @@ class Pipe:
         )
 
     def _is_completion_event(self, ev_type: str, data: Dict[str, Any]) -> bool:
+        # v1.15+: session.idle means the agent finished processing
+        if ev_type == "session.idle":
+            return True
         return ev_type in ("message_stop", "complete", "done", "finished", "end")
 
     # -- Streaming runner ---------------------------------------------------
@@ -726,15 +821,6 @@ class Pipe:
         if httpx is None:
             raise RuntimeError("httpx is required but not installed.")
 
-        body: Dict[str, Any] = {
-            "parts": [{"type": "text", "text": text}],
-        }
-        if self.valves.PROVIDER and self.valves.MODEL:
-            body["model"] = {
-                "providerID": self.valves.PROVIDER,
-                "modelID": self.valves.MODEL,
-            }
-
         base_url = self._container_url(name, port)
         event_queue: asyncio.Queue = asyncio.Queue()
         listener_task = asyncio.create_task(self._sse_listener(base_url, event_queue))
@@ -745,8 +831,8 @@ class Pipe:
         async def _post_prompt():
             async with httpx.AsyncClient() as client:
                 return await client.post(
-                    f"{base_url}/session/{session_id}/prompt",
-                    json=body,
+                    f"{base_url}/session/{session_id}/message",
+                    json={"parts": [{"type": "text", "text": text}]},
                     timeout=300.0,
                 )
 
@@ -756,6 +842,9 @@ class Pipe:
         thinking_buffer = ""
         in_thinking = False
         last_status = ""
+        # Track which partIDs are reasoning parts so we can route
+        # message.part.delta events correctly (text vs thinking).
+        reasoning_part_ids: Set[str] = set()
 
         try:
             while True:
@@ -778,6 +867,71 @@ class Pipe:
                 ev_type = event.get("type", "")
                 data = event.get("data", {})
 
+                # Filter to events for our session only
+                if session_id and data.get("sessionID") and data["sessionID"] != session_id:
+                    continue
+
+                # --- Handle message.part.updated: tracks reasoning parts and
+                # detects thinking start/stop, tool use, etc. ---
+                if ev_type == "message.part.updated":
+                    part = data.get("part", {})
+                    if isinstance(part, dict):
+                        ptype = part.get("type", "")
+                        part_id = part.get("id", "")
+
+                        if ptype == "reasoning":
+                            # Register as a reasoning part for delta routing
+                            if part_id:
+                                reasoning_part_ids.add(part_id)
+                            part_text = part.get("text", "")
+                            has_end = isinstance(part.get("time"), dict) and part.get("time", {}).get("end")
+                            if not part_text and not has_end:
+                                # Empty reasoning part = thinking started
+                                in_thinking = True
+                                thinking_buffer = ""
+                                if last_status != "thinking":
+                                    last_status = "thinking"
+                                    await self._emit_status(event_emitter, "💭 Thinking…")
+                            elif part_text and has_end:
+                                # Reasoning part completed with final text
+                                # Flush any buffered thinking and use the final text
+                                if in_thinking and part_text.strip():
+                                    yield self._format_thinking(part_text)
+                                in_thinking = False
+                                thinking_buffer = ""
+                            continue
+
+                        if ptype == "tool":
+                            tool_name = part.get("tool", "tool")
+                            state = part.get("state", {})
+                            tool_input = state.get("input", {})
+                            if not isinstance(tool_input, dict):
+                                tool_input = {}
+                            preview = _tool_preview(tool_name, tool_input)
+                            status_text = f"🔧 {tool_name}" + (f": {preview}" if preview else "")
+                            await self._emit_status(event_emitter, status_text)
+                            yield self._format_tool_use(tool_name, tool_input)
+                            continue
+
+                    continue
+
+                # --- Handle message.part.delta: route by partID ---
+                if ev_type == "message.part.delta":
+                    part_id = data.get("partID", "")
+                    field = data.get("field", "")
+                    delta = str(data.get("delta", ""))
+
+                    if field == "text":
+                        if part_id in reasoning_part_ids:
+                            # This is a thinking/reasoning delta
+                            thinking_buffer += delta
+                        else:
+                            # This is visible text
+                            text_seen = True
+                            yield delta
+                    continue
+
+                # --- Handle legacy event types (pre-v1.15) ---
                 chunk = self._extract_text_from_event(ev_type, data)
                 if chunk:
                     text_seen = True
@@ -805,11 +959,11 @@ class Pipe:
 
                 tool_info = self._extract_tool_use(ev_type, data)
                 if tool_info:
-                    name, tool_input = tool_info
-                    preview = _tool_preview(name, tool_input)
-                    status_text = f"🔧 {name}" + (f": {preview}" if preview else "")
+                    tool_name_legacy, tool_input = tool_info
+                    preview = _tool_preview(tool_name_legacy, tool_input)
+                    status_text = f"🔧 {tool_name_legacy}" + (f": {preview}" if preview else "")
                     await self._emit_status(event_emitter, status_text)
-                    yield self._format_tool_use(name, tool_input)
+                    yield self._format_tool_use(tool_name_legacy, tool_input)
                     continue
 
                 if self._is_completion_event(ev_type, data):

@@ -412,6 +412,14 @@ class Pipe:
             default=True,
             description="Enable experimental SSE-based streaming. Disabling falls back to single-block responses.",
         )
+        AGENT: str = Field(
+            default="build",
+            description="OpenCode agent name (e.g. build, explore). Passed to session creation and prompt body.",
+        )
+        DEBUG: bool = Field(
+            default=False,
+            description="Emit raw JSON responses into the chat for debugging.",
+        )
 
     def __init__(self) -> None:
         self.valves = self.Valves()
@@ -549,10 +557,20 @@ class Pipe:
             except Exception:
                 pass
 
+        session_body: Dict[str, Any] = {
+            "title": f"OpenWebUI Chat {chat_id[:8]}",
+            "agent": self.valves.AGENT or "build",
+        }
+        if self.valves.PROVIDER and self.valves.MODEL:
+            session_body["model"] = {
+                "providerID": self.valves.PROVIDER,
+                "modelID": self.valves.MODEL,
+            }
+
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 f"{base_url}/session",
-                json={"title": f"OpenWebUI Chat {chat_id[:8]}"},
+                json=session_body,
                 timeout=10.0,
             )
             resp.raise_for_status()
@@ -599,19 +617,39 @@ class Pipe:
 
     # -- Non-streaming prompt / response ------------------------------------
 
+    def _build_message_body(self, text: str) -> Dict[str, Any]:
+        """Build the request body for POST /session/{id}/message."""
+        body: Dict[str, Any] = {
+            "parts": [{"type": "text", "text": text}],
+            "agent": self.valves.AGENT or "build",
+        }
+        if self.valves.PROVIDER and self.valves.MODEL:
+            body["model"] = {
+                "providerID": self.valves.PROVIDER,
+                "modelID": self.valves.MODEL,
+            }
+        return body
+
     async def _send_prompt(self, name: str, port: int, session_id: str, text: str) -> Dict[str, Any]:
         if httpx is None:
             raise RuntimeError("httpx is required but not installed.")
+
+        body = self._build_message_body(text)
+        if self.valves.DEBUG:
+            log.info("OpenCode /message body: %s", json.dumps(body))
 
         base_url = self._container_url(name, port)
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 f"{base_url}/session/{session_id}/message",
-                json={"parts": [{"type": "text", "text": text}]},
+                json=body,
                 timeout=300.0,
             )
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            if self.valves.DEBUG:
+                log.info("OpenCode /message response: %s", json.dumps(data))
+            return data
 
     def _extract_response_text(self, data: Dict[str, Any]) -> str:
         # v1.15+ response shape: {info: {...}, parts: [{type, text, ...}, ...]}
@@ -828,11 +866,15 @@ class Pipe:
         # Give the listener a moment to establish the SSE connection
         await asyncio.sleep(0.3)
 
+        body = self._build_message_body(text)
+        if self.valves.DEBUG:
+            log.info("OpenCode /message body: %s", json.dumps(body))
+
         async def _post_prompt():
             async with httpx.AsyncClient() as client:
                 return await client.post(
                     f"{base_url}/session/{session_id}/message",
-                    json={"parts": [{"type": "text", "text": text}]},
+                    json=body,
                     timeout=300.0,
                 )
 
@@ -988,9 +1030,20 @@ class Pipe:
                 resp = post_task.result()
                 resp.raise_for_status()
                 data = resp.json()
-                yield self._extract_response_text(data)
+                if self.valves.DEBUG:
+                    yield (
+                        f"\n\n_(DEBUG: no SSE text; fallback response:\n"
+                        f"```json\n{json.dumps(data, indent=2, ensure_ascii=False)}\n```\n)_\n\n"
+                    )
+                extracted = self._extract_response_text(data)
+                if extracted.strip():
+                    yield extracted
+                else:
+                    log.warning("Fallback response contained no text: %s", data)
             except Exception as exc:
                 log.warning("Streaming fallback failed: %s", exc)
+                if self.valves.DEBUG:
+                    yield f"\n\n_(DEBUG: streaming fallback error: {exc})_\n\n"
 
     # -- File handling ------------------------------------------------------
 

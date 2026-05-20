@@ -75,6 +75,23 @@ class _DockerHelper:
             capture_output=True,
         )
 
+    def get_logs(self, name: str, tail: int = 60) -> str:
+        """Retrieve the last *tail* lines from a container's logs."""
+        if self._client:
+            try:
+                c = self._client.containers.get(name)
+                return c.logs(tail=tail).decode(errors="replace")
+            except Exception as e:
+                return f"(could not fetch logs via docker-py: {e})"
+        result = subprocess.run(
+            ["docker", "logs", "--tail", str(tail), name],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return result.stdout + result.stderr
+        return f"(could not fetch logs via CLI: {result.stderr})"
+
     def run_container(
         self,
         name: str,
@@ -84,6 +101,23 @@ class _DockerHelper:
         env: Dict[str, str],
         network: Optional[str] = None,
     ) -> None:
+        # Build the startup command.  If _OPENCODE_CFG is in the env we
+        # write it to /workspace/opencode.json *inside* the container before
+        # starting `opencode serve`.  This avoids Docker-in-Docker bind-mount
+        # visibility issues (the file must exist inside the container FS).
+        cfg_json = env.pop("_OPENCODE_CFG", None)
+        if cfg_json:
+            # Shell command: write config then exec opencode serve
+            shell_cmd = (
+                "printf '%s' \"$_OPENCODE_CFG\" > /workspace/opencode.json && "
+                "exec opencode serve --hostname 0.0.0.0 --port 4096"
+            )
+            # Re-add the variable so it's available to the shell printf
+            env["_OPENCODE_CFG"] = cfg_json
+            command_list = ["sh", "-c", shell_cmd]
+        else:
+            command_list = ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"]
+
         if self._client:
             kwargs: Dict[str, Any] = {
                 "image": image,
@@ -92,7 +126,7 @@ class _DockerHelper:
                 "volumes": {str(workdir): {"bind": "/workspace", "mode": "rw"}},
                 "working_dir": "/workspace",
                 "environment": env,
-                "command": ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"],
+                "command": command_list,
             }
             if network:
                 kwargs["network"] = network
@@ -119,12 +153,7 @@ class _DockerHelper:
             "/workspace",
             *env_flags,
             image,
-            "opencode",
-            "serve",
-            "--hostname",
-            "0.0.0.0",
-            "--port",
-            "4096",
+            *command_list,
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -460,15 +489,23 @@ class Pipe:
         if self.valves.GOOGLE_API_KEY:
             env["GOOGLE_API_KEY"] = self.valves.GOOGLE_API_KEY
 
-        # Write an opencode.json config so the container knows which model to use
-        # by default. This avoids sending model in every prompt body (which causes
-        # a 500 if the provider isn't loaded yet or the model ID is unknown).
-        # For custom providers the config also registers the provider itself.
+        # Inject model/provider config so the container knows which model to use.
+        # Strategy: pass the config JSON via the _OPENCODE_CFG env var and have
+        # the container entrypoint write it to /workspace/opencode.json *inside*
+        # the container before starting `opencode serve`.  This guarantees the
+        # config is visible to OpenCode regardless of Docker-in-Docker
+        # bind-mount visibility issues.  We also set OPENCODE_CONFIG as a hint.
         if self.valves.PROVIDER and self.valves.MODEL:
             config = self._build_provider_config(provider)
-            config_path = workdir / ".opencode.json"
+            config_json = json.dumps(config)
+            # Triggers the shell entrypoint in run_container()
+            env["_OPENCODE_CFG"] = config_json
+            # Also set official env vars as secondary mechanisms
+            env["OPENCODE_CONFIG_CONTENT"] = config_json
+            env["OPENCODE_CONFIG"] = "/workspace/opencode.json"
+            # Write to host workdir too (works when bind-mount is visible)
+            config_path = workdir / "opencode.json"
             config_path.write_text(json.dumps(config, indent=2))
-            env["OPENCODE_CONFIG"] = "/workspace/.opencode.json"
         if provider == "custom" and self.valves.CUSTOM_API_KEY:
             env["CUSTOM_OPENCODE_API_KEY"] = self.valves.CUSTOM_API_KEY
 
@@ -559,13 +596,7 @@ class Pipe:
 
         session_body: Dict[str, Any] = {
             "title": f"OpenWebUI Chat {chat_id[:8]}",
-            "agent": self.valves.AGENT or "build",
         }
-        if self.valves.PROVIDER and self.valves.MODEL:
-            session_body["model"] = {
-                "providerID": self.valves.PROVIDER,
-                "modelID": self.valves.MODEL,
-            }
 
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -618,16 +649,17 @@ class Pipe:
     # -- Non-streaming prompt / response ------------------------------------
 
     def _build_message_body(self, text: str) -> Dict[str, Any]:
-        """Build the request body for POST /session/{id}/message."""
+        """Build the request body for POST /session/{id}/message.
+
+        Model selection is handled by .opencode.json written at container
+        start-up, so we do NOT include ``model`` here — sending it in the
+        body causes a 500 if the provider isn't fully loaded yet.
+        """
         body: Dict[str, Any] = {
             "parts": [{"type": "text", "text": text}],
-            "agent": self.valves.AGENT or "build",
         }
-        if self.valves.PROVIDER and self.valves.MODEL:
-            body["model"] = {
-                "providerID": self.valves.PROVIDER,
-                "modelID": self.valves.MODEL,
-            }
+        if self.valves.AGENT:
+            body["agent"] = self.valves.AGENT
         return body
 
     async def _send_prompt(self, name: str, port: int, session_id: str, text: str) -> Dict[str, Any]:
@@ -645,7 +677,10 @@ class Pipe:
                 json=body,
                 timeout=300.0,
             )
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                error_body = resp.text
+                log.error("OpenCode /message error %d: %s", resp.status_code, error_body)
+                resp.raise_for_status()
             data = resp.json()
             if self.valves.DEBUG:
                 log.info("OpenCode /message response: %s", json.dumps(data))
@@ -1042,8 +1077,23 @@ class Pipe:
                     log.warning("Fallback response contained no text: %s", data)
             except Exception as exc:
                 log.warning("Streaming fallback failed: %s", exc)
+                # Extract the response body from HTTP errors for debugging
+                error_detail = str(exc)
+                if hasattr(exc, "response") and exc.response is not None:
+                    try:
+                        error_detail += f" | Response body: {exc.response.text}"
+                    except Exception:
+                        pass
                 if self.valves.DEBUG:
-                    yield f"\n\n_(DEBUG: streaming fallback error: {exc})_\n\n"
+                    # Also fetch container logs for deeper insight
+                    container_name = _chat_containers.get(session_id, {}).get("name", "")
+                    # session_id here is the function param; look up by iterating
+                    cname = name  # 'name' param is the container name
+                    container_logs = self._docker.get_logs(cname, tail=30)
+                    yield (
+                        f"\n\n_(DEBUG: streaming fallback error: {error_detail})_\n\n"
+                        f"\n\n_(DEBUG: container logs tail:\n```\n{container_logs}\n```\n)_\n\n"
+                    )
 
     # -- File handling ------------------------------------------------------
 
